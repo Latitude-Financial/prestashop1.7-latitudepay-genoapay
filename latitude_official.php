@@ -188,7 +188,8 @@ class Latitude_Official extends PaymentModule
         'displayAdminOrderTabContent',
         'actionOrderSlipAdd',
         'displayBackOfficeHeader',
-        'displayExpressCheckout'
+        'displayExpressCheckout',
+        'actionObjectAddBefore'
     );
 
     /**
@@ -209,7 +210,7 @@ class Latitude_Official extends PaymentModule
          */
         $this->tab = 'payments_gateways';
 
-        $this->version = '1.2';
+        $this->version = '1.3';
         $this->author = 'Latitude Financial Services';
 
         /**
@@ -439,30 +440,61 @@ class Latitude_Official extends PaymentModule
     }
 
     public function hookDisplayExpressCheckout($params) {
-        $cart = isset($params['cart']) ? $params['cart'] : null;
-        if ($cart) {
-            $price = $cart->getOrderTotal();
-            if ($price >= $this->getMinOrderTotal()) {
-                $currencyCode = $this->context->currency->iso_code;
-                $gatewayName = $this->getPaymentGatewayNameByCurrencyCode($currencyCode);
-
-                if ($gatewayName) {
-                    $this->smarty->assign(array(
-                        'services' => $this->getServices($gatewayName),
-                        'payment_terms' => Configuration::get(self::LATITUDE_FINANCE_PAYMENT_TERMS),
-                        'base_dir' => Configuration::get('PS_SSL_ENABLED') ? _PS_BASE_URL_SSL_ : _PS_BASE_URL_ . __PS_BASE_URI__,
-                        'current_module_uri' => $this->_path,
-                        'images_api_url' => Tools::getValue(self::LATITUDE_FINANCE_IMAGES_API_URL, self::DEFAULT_IMAGES_API_URL),
-                        'images_api_version' => self::DEFAULT_IMAGES_API_VERSION,
-                        'full_block' => false,
-                        'amount' => $price,
-                        'gateway_name' => $gatewayName
-                    ));
-
-                    return $this->display(__FILE__, 'payment_snippet.tpl');
-                }
+        try {
+            if (!$this->isValidCurrency()) {
+                return "";
             }
+            $cart = isset($params['cart']) ? $params['cart'] : null;
+            if ($cart) {
+                $price = $cart->getOrderTotal();
+                if ($price >= $this->getMinOrderTotal()) {
+                    $currency = $this->context->currency;
+                    if (!$currency) {
+                        return '';
+                    }
+                    $currencyCode = $currency->iso_code;
+                    $gatewayName = $this->getPaymentGatewayNameByCurrencyCode($currencyCode);
 
+                    if ($gatewayName) {
+                        $this->smarty->assign(array(
+                            'services' => $gatewayName === self::GENOAPAY_PAYMENT_METHOD_CODE ? self::PRODUCT_GPAY : $this->getServices($gatewayName),
+                            'payment_terms' => Configuration::get(self::LATITUDE_FINANCE_PAYMENT_TERMS),
+                            'base_dir' => Configuration::get('PS_SSL_ENABLED') ? _PS_BASE_URL_SSL_ : _PS_BASE_URL_ . __PS_BASE_URI__,
+                            'current_module_uri' => $this->_path,
+                            'images_api_url' => Tools::getValue(self::LATITUDE_FINANCE_IMAGES_API_URL, self::DEFAULT_IMAGES_API_URL),
+                            'images_api_version' => self::DEFAULT_IMAGES_API_VERSION,
+                            'full_block' => false,
+                            'amount' => $price,
+                            'gateway_name' => $gatewayName
+                        ));
+
+                        return $this->display(__FILE__, 'payment_snippet.tpl');
+                    }
+                }
+
+            }
+        } catch (Exception $exception) {
+            return "";
+        }
+    }
+
+    /**
+     * Assign the generated order reference to new order
+     * @param $params
+     * @return void
+     */
+    public function hookActionObjectAddBefore($params)
+    {
+        $order = $params['object'];
+        if ($order instanceof Order) {
+            $cookie = $this->context->cookie;
+            $reservedReference = $cookie->__get('lpay_reserve_order_reference');
+            $cartId = $cookie->__get('lpay_reserve_order_cart_id');
+            if ( $reservedReference && $cartId && $cartId == $order->id_cart ) {
+                $order->reference = $reservedReference;
+                $cookie->__unset('lpay_reserve_order_reference');
+                $cookie->__unset('lpay_reserve_order_cart_id');
+            }
         }
     }
 
@@ -514,7 +546,7 @@ class Latitude_Official extends PaymentModule
             return false;
         }
 
-        return true;
+        return strtoupper($configuration['name']) === strtoupper($this->getPaymentGatewayNameByCurrencyCode());
     }
 
     /**
@@ -578,26 +610,22 @@ class Latitude_Official extends PaymentModule
     /**
      * Get payment gateway name base on currency code
      * @param null $currencyCode
-     * @return string
-     * @throws Exception
+     * @return string|bool
      */
     public function getPaymentGatewayNameByCurrencyCode($currencyCode = null)
     {
-        $countryToCurrencyCode = [
-            'NZ' => 'NZD',
-            'AU' => 'AUD',
-        ];
-
         /**
          * If the currency object still not initialized then use the country object as the default setting
          */
         if (!$currencyCode) {
-            $countryCode = $this->context->country->iso_code;
-            if (!isset($countryToCurrencyCode[$countryCode])) {
-                throw new Expcetion(sprintf("The country code: %s cannot to map with a supported currency code.", $countryCode));
+            if (!$this->context->currency) {
+                $currencyId = Configuration::get('PS_CURRENCY_DEFAULT');
+                $currency = new Currency($currencyId);
+                $currencyCode = $currency->iso_code;
+            } else {
+                $currencyCode = $this->context->currency->iso_code;
             }
 
-            $currencyCode = $countryToCurrencyCode[$countryCode];
         }
 
         $this->gatewayName = $gatewayName = '';
@@ -609,7 +637,7 @@ class Latitude_Official extends PaymentModule
                 $this->gatewayName = $gatewayName = self::GENOAPAY_PAYMENT_METHOD_CODE;
                 break;
             default:
-                throw new Exception("The extension does not support for the current currency for the shop.");
+                return false;
         }
 
         return $gatewayName;
@@ -665,41 +693,45 @@ class Latitude_Official extends PaymentModule
      */
     public function hookPaymentOptions($params)
     {
-        $cartAmount = $params['cart']->getOrderTotal();
-        $currency = new Currency($params['cart']->id_currency);
-        $this->gatewayName = $this->getPaymentGatewayNameByCurrencyCode($currency->iso_code);
+        $currency = $this->context->currency;
+        if ($currency) {
+            $cartAmount = $params['cart']->getOrderTotal();
+            $this->gatewayName = $this->getPaymentGatewayNameByCurrencyCode($currency->iso_code);
 
-        if (!$this->active || !$this->isOrderAmountAvailable($cartAmount)) {
-            return [];
-        }
+            if (!$this->active || !$this->isOrderAmountAvailable($cartAmount)) {
+                return null;
+            }
 
-        if (!$this->checkApiConnection()) {
-            $this->context->smarty->assign(array(
-                'latitudeError' => $this->l(
-                    'No credentials have been provided for Latitude Finance. Please contact the owner of the website.',
-                    $this->name
-                )
+            if (!$this->checkApiConnection()) {
+                $this->context->smarty->assign(array(
+                    'latitudeError' => $this->l(
+                        'No credentials have been provided for Latitude Finance. Please contact the owner of the website.',
+                        $this->name
+                    )
+                ));
+                return null;
+            }
+
+            $this->smarty->assign(array(
+                'gateway_name' => $this->gatewayName,
+                'amount' => $cartAmount,
+                'full_block' => true,
+                'images_api_url' => Tools::getValue(self::LATITUDE_FINANCE_IMAGES_API_URL, self::DEFAULT_IMAGES_API_URL),
+                'images_api_version' => self::DEFAULT_IMAGES_API_VERSION,
+                'services' => $this->gatewayName === self::GENOAPAY_PAYMENT_METHOD_CODE ? self::PRODUCT_GPAY : $this->getServices($this->gatewayName),
+                'payment_terms' => Configuration::get(self::LATITUDE_FINANCE_PAYMENT_TERMS)
             ));
+            $newOption = new PaymentOption();
+            $newOption->setModuleName($this->name)
+                ->setCallToActionText($this->trans($this->getPaymentGatewayNameByCurrencyCode($currency->iso_code)))
+                ->setAction($this->context->link->getModuleLink($this->name, 'payment', [], true))
+                ->setLogo($this->getPaymentLogo())
+                ->setAdditionalInformation(
+                    $this->fetch('module:latitude_official/views/templates/hook/payment_snippet.tpl')
+                );
+            return [$newOption];
         }
-
-        $this->smarty->assign(array(
-            'gateway_name' => $this->gatewayName,
-            'amount' => $cartAmount,
-            'full_block' => true,
-            'images_api_url' => Tools::getValue(self::LATITUDE_FINANCE_IMAGES_API_URL, self::DEFAULT_IMAGES_API_URL),
-            'images_api_version' => self::DEFAULT_IMAGES_API_VERSION,
-            'services' => $this->getServices($this->gatewayName),
-            'payment_terms' => Configuration::get(self::LATITUDE_FINANCE_PAYMENT_TERMS)
-        ));
-        $newOption = new PaymentOption();
-        $newOption->setModuleName($this->name)
-            ->setCallToActionText($this->trans($this->getPaymentGatewayNameByCurrencyCode($currency->iso_code)))
-            ->setAction($this->context->link->getModuleLink($this->name, 'payment', [], true))
-            ->setLogo($this->getPaymentLogo())
-            ->setAdditionalInformation(
-                $this->fetch('module:latitude_official/views/templates/hook/payment_snippet.tpl')
-            );
-        return [$newOption];
+        return [];
     }
 
     /**
@@ -739,16 +771,22 @@ class Latitude_Official extends PaymentModule
         ) {
             return "";
         }
+
+        if (!$this->isValidCurrency()) {
+            return "";
+        }
+
         $currency = $this->context->currency;
+
         /** @var \PrestaShop\PrestaShop\Adapter\Presenter\Product\ProductLazyArray $product */
         $product = $params['product'];
         $price = Tools::ps_round($product->offsetGet('price_amount'), (int)$currency->precision);
-        $currencyCode = $this->context->currency->iso_code;
+        $currencyCode = $currency->iso_code;
         $gatewayName = $this->getPaymentGatewayNameByCurrencyCode($currencyCode);
 
         if ($gatewayName && $product->offsetGet('quantity')) {
             $this->smarty->assign(array(
-                'services' => Configuration::get(self::LATITUDE_FINANCE_PRODUCT),
+                'services' => $gatewayName === self::GENOAPAY_PAYMENT_METHOD_CODE ? self::PRODUCT_GPAY : Configuration::get(self::LATITUDE_FINANCE_PRODUCT),
                 'payment_terms' => Configuration::get(self::LATITUDE_FINANCE_PAYMENT_TERMS),
                 'base_dir' => Configuration::get('PS_SSL_ENABLED') ? _PS_BASE_URL_SSL_ : _PS_BASE_URL_ . __PS_BASE_URI__,
                 'current_module_uri' => $this->_path,
@@ -838,6 +876,7 @@ class Latitude_Official extends PaymentModule
                         'type' => 'select',
                         'label' => $this->l('Product'),
                         'name' => self::LATITUDE_FINANCE_PRODUCT,
+                        'disabled' => Configuration::get(self::LATITUDE_FINANCE_TITLE) === self::GENOAPAY_PAYMENT_METHOD_CODE,
                         'options' => array(
                             'query' => $this->getProducts(),
                             'id' => 'id_option',
@@ -941,6 +980,12 @@ class Latitude_Official extends PaymentModule
                 ),
             ),
         );
+
+        if (Configuration::get(self::LATITUDE_FINANCE_TITLE) === self::GENOAPAY_PAYMENT_METHOD_CODE) {
+            $fields_form['form']['input'] = array_filter($fields_form['form']['input'], function($field) {
+                return $field['name'] !== self::LATITUDE_FINANCE_PRODUCT && $field['name'] !== self::LATITUDE_FINANCE_PAYMENT_TERMS;
+            });
+        }
 
         $helper = new HelperForm();
         $helper->show_toolbar = false;
@@ -1130,7 +1175,7 @@ class Latitude_Official extends PaymentModule
      */
     protected function isOrderAmountAvailable($amount)
     {
-        if ($amount > $this->getMaxOrderTotal() || $amount < $this->getMinOrderTotal()) {
+        if ( $amount < $this->getMinOrderTotal() ) {
             return false;
         }
         return true;
@@ -1420,6 +1465,9 @@ class Latitude_Official extends PaymentModule
      * @return bool
      */
     private function shouldDisplayPaymentTerms() {
+        if (Configuration::get(self::LATITUDE_FINANCE_TITLE) === self::GENOAPAY_PAYMENT_METHOD_CODE) {
+            return false;
+        }
         return in_array(Tools::getValue(self::LATITUDE_FINANCE_PRODUCT), [
             self::PRODUCT_LPAYPLUS, self::PRODUCT_CO_PRESENTMENT
         ]);
@@ -1432,5 +1480,20 @@ class Latitude_Official extends PaymentModule
      */
     private function getServices($gatewayName) {
         return $gatewayName === self::GENOAPAY_PAYMENT_METHOD_CODE ? self::PRODUCT_GPAY : Configuration::get(self::LATITUDE_FINANCE_PRODUCT);
+    }
+
+    /**
+     * Check if the current currency is valid with the configured value
+     * @return bool
+     */
+    protected function isValidCurrency()
+    {
+        $currency = $this->context->currency;
+        if (!$currency) {
+            $currency = Configuration::get('PS_CURRENCY_DEFAULT');
+        }
+        $gateway = $this->getPaymentGatewayNameByCurrencyCode($currency->iso_code);
+        $configuredGateway = Configuration::get('LATITUDE_FINANCE_TITLE');
+        return strtolower($gateway) === strtolower($configuredGateway);
     }
 }

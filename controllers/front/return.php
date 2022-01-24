@@ -6,8 +6,8 @@ class latitude_officialreturnModuleFrontController extends ModuleFrontController
     /**
      * @var integer - Order state
      */
-    const PAYMENT_ACCEPECTED = 2;
-    const PAYMENT_ERROR = 8;
+    const PAYMENT_ACCEPTED = 2;
+    const PAYMENT_IN_PROGRESS = 3;
 
     const PAYMENT_SUCCESS_STATES = [
         'COMPLETED'
@@ -27,6 +27,8 @@ class latitude_officialreturnModuleFrontController extends ModuleFrontController
         parent::initContent();
         // Add the validation
         $reference = Tools::getValue('reference');
+        $currencyCode = $this->context->currency->iso_code;
+        $gatewayName = $this->module->getPaymentGatewayNameByCurrencyCode($currencyCode);
 
         if (Configuration::get(Latitude_Official::LATITUDE_FINANCE_DEBUG_MODE)) {
             $logMessage = "======CALLBACK INFO STARTS======\n";
@@ -40,25 +42,58 @@ class latitude_officialreturnModuleFrontController extends ModuleFrontController
         }
 
         $cart = $this->context->cart;
-        $response = Tools::getAllValues();
         $responseState = Tools::getValue('result');
+
+        // Verify payment token
+        $token = $this->context->cookie->payment_token;
+        $this->context->cookie->payment_token = null;
+        if ($token !== Tools::getValue('token')) {
+            $this->errors[] = Context::getContext()->getTranslator()->trans("Invalid payment token.");
+            Tools::redirect('index.php?controller=order&step=1');
+        }
+
+        // Verify signature
+        if (!$this->validateSignature($gatewayName)) {
+            $this->errors[] = Context::getContext()->getTranslator()->trans("Invalid response signature.");
+            Tools::redirect('index.php?controller=order&step=1');
+        }
+
         // success
         if (in_array($responseState, self::PAYMENT_SUCCESS_STATES)) {
-            $currencyCode = $this->context->currency->iso_code;
-            $gatewayName = $this->module->getPaymentGatewayNameByCurrencyCode($currencyCode);
+            $verifyCartAmount = floatval($this->context->cookie->__get('cart_amount'));
+            if (!$verifyCartAmount) {
+                $this->context->cookie->__set('latitude_finance_redirect_error', $this->translateErrorMessage("Your order was placed already."));
+                Tools::redirect('index.php?controller=order&step=1');
+            }
+            $this->context->cookie->__unset('cart_amount');
+            $orderAmount = $cart->getOrderTotal();
+            $isInvalidAmount = $verifyCartAmount < $orderAmount;
+            $orderMessage = $isInvalidAmount ?
+                sprintf(
+                    'Invalid payment amount detected! Correct amount: %s, paid: %s, token: %s',
+                    $verifyCartAmount,
+                    $orderAmount,
+                    $token
+                ) : '';
             $this->module->validateOrder(
                 $cart->id,
-                self::PAYMENT_ACCEPECTED,
-                $cart->getOrderTotal(),
+                $isInvalidAmount ? self::PAYMENT_IN_PROGRESS : self::PAYMENT_ACCEPTED,
+                $verifyCartAmount,
                 $gatewayName,
-                '',
-                array(
-                    'transaction_id' => Tools::getValue('token')
-                )
+                $orderMessage,
+                [ 'transaction_id' => Tools::getValue('token') ]
             );
+            if ($isInvalidAmount) {
+                $this->context->cookie->__set(
+                    'latitude_finance_redirect_error',
+                    $this->translateErrorMessage("There was an issue with your order, please contact administrator for more information.")
+                );
+                Tools::redirect('index.php?controller=order&step=1');
+            }
         } else {
-            $this->errors[] = Context::getContext()->getTranslator()->trans("Your purchase order has been cancelled.");
-            $this->redirectWithNotifications('index.php?controller=order&step=1');
+            $this->errors[] = Context::getContext()->getTranslator()
+                ->trans("Your purchase order has been cancelled.");
+            Tools::redirect('index.php?controller=cart&action=show');
         }
 
         $customer = new Customer($cart->id_customer);
@@ -85,5 +120,31 @@ class latitude_officialreturnModuleFrontController extends ModuleFrontController
                 break;
         }
         return $message;
+    }
+
+    /**
+     * Check if response signature is valid
+     * @param $gatewayName
+     * @param $request
+     * @return bool
+     */
+    private function validateSignature($gatewayName)
+    {
+        /**
+         * @var BinaryPay $gateway
+         */
+        $gateway = $this->module->getGateway($gatewayName);
+        $gluedString = $gateway->recursiveImplode(
+            array(
+                'token' => Tools::getValue('token'),
+                'reference' => $this->context->cookie->reference,
+                'message' => Tools::getValue('message'),
+                'result' => Tools::getValue('result'),
+            ),
+            '',
+            true
+        );
+        $signature = hash_hmac( 'sha256', base64_encode( $gluedString ), $gateway->getConfig( 'password' ) );
+        return $signature === Tools::getValue('signature');
     }
 }
